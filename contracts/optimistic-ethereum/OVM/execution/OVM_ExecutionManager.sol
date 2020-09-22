@@ -49,6 +49,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
     address constant GAS_METADATA_ADDRESS = 0x06a506A506a506A506a506a506A506A506A506A5;
     uint256 constant NUISANCE_GAS_SLOAD = 20000;
     uint256 constant NUISANCE_GAS_SSTORE = 20000;
+    uint256 constant MIN_NUISANCE_GAS_PER_CONTRACT = 30000;
     uint256 constant NUISANCE_GAS_PER_CONTRACT_BYTE = 100;
     uint256 constant MIN_GAS_FOR_INVALID_STATE_ACCESS = 30000;
 
@@ -125,7 +126,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
 
         // Make sure the transaction's gas limit is valid. We don't revert here because we reserve
         // reverts for INVALID_STATE_ACCESS.
-        if (_isValidGasLimit(_transaction.gasLimit, _transaction.queueOrigin) == false) {
+        if (_isValidGasLimit(_transaction.gasLimit, _transaction.l1QueueOrigin) == false) {
             return;
         }
 
@@ -142,7 +143,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
         uint256 gasUsed = gasProvided - gasleft();
 
         // Update the cumulative gas based on the amount of gas used.
-        _updateCumulativeGas(gasUsed, _transaction.queueOrigin);
+        _updateCumulativeGas(gasUsed, _transaction.l1QueueOrigin);
 
         // Wipe the execution context.
         _resetContext();
@@ -184,21 +185,6 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
     }
 
     /**
-     * @notice Overrides ORIGIN.
-     * @return _ORIGIN Address of the ORIGIN within the transaction context.
-     */
-    function ovmORIGIN()
-        override
-        public
-        view
-        returns (
-            address _ORIGIN
-        )
-    {
-        return transactionContext.ovmORIGIN;
-    }
-
-    /**
      * @notice Overrides TIMESTAMP.
      * @return _TIMESTAMP Value of the TIMESTAMP within the transaction context.
      */
@@ -211,6 +197,21 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
         )
     {
         return transactionContext.ovmTIMESTAMP;
+    }
+
+    /**
+     * @notice Overrides NUMBER.
+     * @return _NUMBER Value of the NUMBER within the transaction context.
+     */
+    function ovmNUMBER()
+        override
+        public
+        view
+        returns (
+            uint256 _NUMBER
+        )
+    {
+        return transactionContext.ovmNUMBER;
     }
 
     /**
@@ -243,6 +244,39 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
         return globalContext.ovmCHAINID;
     }
 
+    /*********************************
+     * Opcodes: L2 Execution Context *
+     *********************************/
+
+    /**
+     * @notice Specifies from which L1 rollup queue this transaction originated from.
+     * @return _queueOrigin Address of the CALLER within the current message context.
+     */
+    function ovmL1QUEUEORIGIN()
+        override
+        public
+        view
+        returns (
+            Lib_OVMCodec.QueueOrigin _queueOrigin
+        )
+    {
+        return transactionContext.ovmL1QUEUEORIGIN;
+    }
+
+    /**
+     * @notice Specifies what L1 EOA, if any, sent this transaction.
+     * @return _l1TxOrigin Address of the EOA which send the tx into L2 from L1.
+     */
+    function ovmL1TXORIGIN()
+        override
+        public
+        view
+        returns (
+            address _l1TxOrigin
+        )
+    {
+        return transactionContext.ovmL1TXORIGIN;
+    }
 
     /********************
      * Opcodes: Halting *
@@ -692,7 +726,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
     )
         override
         public
-    {
+    {   
         // Since this function is public, anyone can attempt to directly call it. We need to make
         // sure that the OVM_ExecutionManager itself is the only party that can actually try to
         // call this function.
@@ -1146,7 +1180,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
         // on the size of the contract code.
         if (_wasAccountAlreadyLoaded == false) {
             _useNuisanceGas(
-                Lib_EthUtils.getCodeSize(_getAccountEthAddress(_address)) * NUISANCE_GAS_PER_CONTRACT_BYTE
+                (Lib_EthUtils.getCodeSize(_getAccountEthAddress(_address)) * NUISANCE_GAS_PER_CONTRACT_BYTE) + MIN_NUISANCE_GAS_PER_CONTRACT
             );
         }
     }
@@ -1172,7 +1206,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
         if (_wasAccountAlreadyChanged == false) {
             ovmStateManager.incrementTotalUncommittedAccounts();
             _useNuisanceGas(
-                Lib_EthUtils.getCodeSize(_getAccountEthAddress(_address)) * NUISANCE_GAS_PER_CONTRACT_BYTE
+                (Lib_EthUtils.getCodeSize(_getAccountEthAddress(_address)) * NUISANCE_GAS_PER_CONTRACT_BYTE) + MIN_NUISANCE_GAS_PER_CONTRACT
             );
         }
     }
@@ -1275,8 +1309,11 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
             bytes memory _revertdata
         )
     {
-        // Running out of gas will return no data, so simulating it shouldn't either.
-        if (_flag == RevertFlag.OUT_OF_GAS) {
+        // Out of gas and create exceptions will fundamentally return no data, so simulating it shouldn't either.
+        if (
+            _flag == RevertFlag.OUT_OF_GAS
+            || _flag == RevertFlag.CREATE_EXCEPTION
+        ) {
             return bytes('');
         }
 
@@ -1472,7 +1509,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
      */
     function _isValidGasLimit(
         uint256 _gasLimit,
-        uint256 _queueOrigin
+        Lib_OVMCodec.QueueOrigin _queueOrigin
     )
         internal
         returns (
@@ -1489,7 +1526,7 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
 
         GasMetadataKey cumulativeGasKey;
         GasMetadataKey prevEpochGasKey;
-        if (_queueOrigin == uint256(QueueOrigin.SEQUENCER_QUEUE)) {
+        if (_queueOrigin == Lib_OVMCodec.QueueOrigin.SEQUENCER_QUEUE) {
             cumulativeGasKey = GasMetadataKey.CUMULATIVE_SEQUENCER_QUEUE_GAS;
             prevEpochGasKey = GasMetadataKey.PREV_EPOCH_SEQUENCER_QUEUE_GAS;
         } else {
@@ -1513,12 +1550,12 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
      */
     function _updateCumulativeGas(
         uint256 _gasUsed,
-        uint256 _queueOrigin
+        Lib_OVMCodec.QueueOrigin _queueOrigin
     )
         internal
     {
         GasMetadataKey cumulativeGasKey;
-        if (_queueOrigin == uint256(QueueOrigin.SEQUENCER_QUEUE)) {
+        if (_queueOrigin == Lib_OVMCodec.QueueOrigin.SEQUENCER_QUEUE) {
             cumulativeGasKey = GasMetadataKey.CUMULATIVE_SEQUENCER_QUEUE_GAS;
         } else {
             cumulativeGasKey = GasMetadataKey.CUMULATIVE_L1TOL2_QUEUE_GAS;
@@ -1619,8 +1656,10 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
         internal
     {
         transactionContext.ovmTIMESTAMP = _transaction.timestamp;
+        transactionContext.ovmNUMBER = _transaction.number;
         transactionContext.ovmTXGASLIMIT = _transaction.gasLimit;
-        transactionContext.ovmQUEUEORIGIN = _transaction.queueOrigin;
+        transactionContext.ovmL1QUEUEORIGIN = _transaction.l1QueueOrigin;
+        transactionContext.ovmL1TXORIGIN = _transaction.l1Txorigin;
         transactionContext.ovmGASLIMIT = gasMeterConfig.maxGasPerQueuePerEpoch;
     }
 
@@ -1630,11 +1669,12 @@ contract OVM_ExecutionManager is iOVM_ExecutionManager {
     function _resetContext()
         internal
     {
-        transactionContext.ovmORIGIN = address(0);
+        transactionContext.ovmL1TXORIGIN = address(0);
         transactionContext.ovmTIMESTAMP = 0;
+        transactionContext.ovmNUMBER = 0;
         transactionContext.ovmGASLIMIT = 0;
         transactionContext.ovmTXGASLIMIT = 0;
-        transactionContext.ovmQUEUEORIGIN = 0;
+        transactionContext.ovmL1QUEUEORIGIN = Lib_OVMCodec.QueueOrigin.SEQUENCER_QUEUE;
 
         transactionRecord.ovmGasRefund = 0;
 
